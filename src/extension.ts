@@ -60,6 +60,26 @@ function isInAction(
 	return line.match(/(add|remove|has|doing|did)_action\([\s]*('|")[^"|']*$/);
 }
 
+function isInHookUse(
+	line: string,
+): RegExpMatchArray | null {
+	return line.match(/add_(filter|action)\(/);
+}
+
+
+function isInCurrentNamespaceFunctionCallback(
+	line: string,
+): RegExpMatchArray | null {
+	return line.match(/add_(?:filter|action)\(\s*['"](?<hook>\S+?)['"],\s*__NAMESPACE__ \. ['"](?<func>\S*)/);
+}
+
+function isInFunctionCallback(
+	line: string,
+): RegExpMatchArray | null {
+	//                 add_   filter|action  (    '" {  hook     } '" ,    '" {  func     }
+	return line.match(/add_(?:filter|action)\(\s*['"](?<hook>\S+?)['"],\s*['"](?<func>\S*)/);
+}
+
 function isInFunctionDeclaration(
 	line: string,
 ): RegExpMatchArray | null {
@@ -243,6 +263,96 @@ function getContainingSymbol(
 	context.inFunction = (context.symbol.kind === vscode.SymbolKind.Function);
 
 	return context;
+}
+
+function getSymbolLocationForGlobalFunction(match: RegExpMatchArray) {
+	const search = match.groups?.func || null;
+
+	if (!search) {
+		return undefined;
+	}
+
+	return searchWorkspaceSymbols(search).then((symbols) => {
+		if (!symbols) {
+			return undefined;
+		}
+
+		// eslint-disable-next-line arrow-body-style
+		const functionSymbols = symbols.filter((symbol) => {
+			return (
+				symbol.name === search
+				&& !symbol.containerName
+				&& symbol.kind === vscode.SymbolKind.Function
+			);
+		});
+		const functionLocations = functionSymbols.map((symbol) => symbol.location);
+
+		return functionLocations;
+	});
+}
+
+function getCurrentNamespace() {
+	if (vscode.window.activeTextEditor === undefined) {
+		return undefined;
+	}
+
+	const symbolProvider = vscode.commands
+		.executeCommand<vscode.DocumentSymbol[]>(
+			'vscode.executeDocumentSymbolProvider',
+			vscode.window.activeTextEditor.document.uri,
+		);
+
+	return symbolProvider.then((symbols) => {
+		if (!symbols) {
+			return undefined;
+		}
+
+		const namespaces = symbols.filter((symbol) => symbol.kind === vscode.SymbolKind.Namespace);
+
+		if (!namespaces) {
+			return undefined;
+		}
+
+		const [currentNamespace] = namespaces;
+
+		return currentNamespace.name;
+	});
+}
+
+function getSymbolLocationForNamespacedFunction(namespace: string, match: RegExpMatchArray) {
+	const search = match.groups?.func || null;
+
+	if (!search) {
+		return undefined;
+	}
+
+	const functionSearch = search.replace(/^\\\\?/g, '');
+
+	return searchWorkspaceSymbols(functionSearch).then((symbols) => {
+		if (!symbols) {
+			return undefined;
+		}
+
+		// eslint-disable-next-line arrow-body-style
+		const functionSymbols = symbols.filter((symbol) => {
+			return (
+				symbol.name === functionSearch
+				&& symbol.containerName === namespace
+				&& symbol.kind === vscode.SymbolKind.Function
+			);
+		});
+		const functionLocations = functionSymbols.map((symbol) => symbol.location);
+
+		return functionLocations;
+	});
+}
+
+function searchWorkspaceSymbols(search: string) {
+	return vscode.commands
+		.executeCommand<vscode.SymbolInformation[]>(
+			'vscode.executeWorkspaceSymbolProvider',
+			search,
+		);
 }
 
 export function activate(
@@ -616,5 +726,50 @@ export function activate(
 		},
 	);
 
-	context.subscriptions.push(hooksProvider, callbackProvider, hoverProvider);
+	const definitionProvider = vscode.languages.registerDefinitionProvider(
+		'php',
+		{
+			provideDefinition(document, position) {
+				const pos = document.getWordRangeAtPosition(position);
+
+				if (!pos) {
+					return undefined;
+				}
+
+				const linePrefix = document.lineAt(position).text.substr(0, pos.end.character);
+
+				if (!isInHookUse(linePrefix)) {
+					return undefined;
+				}
+
+				const namespacedFunctionCallback = isInCurrentNamespaceFunctionCallback(linePrefix);
+
+				if (namespacedFunctionCallback) {
+					const currentNamespace = getCurrentNamespace();
+
+					if (!currentNamespace) {
+						return undefined;
+					}
+
+					return currentNamespace.then((namespace) => {
+						if (!namespace) {
+							return undefined;
+						}
+
+						return getSymbolLocationForNamespacedFunction(namespace, namespacedFunctionCallback);
+					});
+				}
+
+				const functionCallback = isInFunctionCallback(linePrefix);
+
+				if (functionCallback) {
+					return getSymbolLocationForGlobalFunction(functionCallback);
+				}
+
+				return undefined;
+			},
+		},
+	);
+
+	context.subscriptions.push(hooksProvider, callbackProvider, hoverProvider, definitionProvider);
 }
